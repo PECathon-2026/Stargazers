@@ -1,136 +1,131 @@
 import http from 'node:http'
+import { randomUUID } from 'node:crypto'
+import { ApiError, sendError, sendJson, validateCoordinates } from './src/http.js'
+import { checkRateLimit } from './src/middleware/rate-limit.js'
+import { getEvents } from './src/services/events.js'
+import { getMoonPhase } from './src/services/moon.js'
+import { getNearbySpots } from './src/services/spots.js'
+import { getUpcomingLaunches } from './src/services/launches.js'
+import { getVisibilityMap, getWeather } from './src/services/weather.js'
 
 const PORT = Number(process.env.PORT || 3001)
-const WEATHER_TIMEOUT_MS = 8_000
-const SYNODIC_MONTH_DAYS = 29.530588853
-const KNOWN_NEW_MOON_UTC = Date.UTC(2000, 0, 6, 18, 14)
+if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65_535) throw new Error('PORT must be an integer from 1 to 65535.')
+const MAX_URL_LENGTH = 2_048
+const configuredOrigins = new Set((process.env.CORS_ORIGINS || '').split(',').map((origin) => origin.trim()).filter(Boolean))
 
-// These are presentation examples for the hackathon demo, not a live ephemeris.
-const demoEvents = [
-  { id: 'meteor-shower', day: 'SKY GUIDE', type: 'METEOR SHOWER', title: 'Meteor shower watching', detail: 'Find a dark location and let your eyes adjust.', icon: '✦' },
-  { id: 'moon-watch', day: 'MOON WATCH', type: 'MOON PHASE', title: 'Track the lunar cycle', detail: 'Use the live phase indicator for tonight’s moon.', icon: '◐' },
-  { id: 'iss-watch', day: 'ORBITAL GUIDE', type: 'ISS PASS', title: 'Spot the space station', detail: 'Check a trusted pass predictor for local timings.', icon: '⌁' },
-]
-
-function send(response, status, body) {
-  response.writeHead(status, {
-    'Content-Type': 'application/json; charset=utf-8',
-    'Cache-Control': 'no-store',
-    'X-Content-Type-Options': 'nosniff',
-  })
-  response.end(JSON.stringify(body))
+function applyCors(request, response) {
+  const origin = request.headers.origin
+  if (!origin) return
+  const isLocalDevOrigin = /^https?:\/\/(localhost|127\.0\.0\.1):\d+$/.test(origin)
+  if (!isLocalDevOrigin && !configuredOrigins.has(origin)) {
+    throw new ApiError(403, 'ORIGIN_NOT_ALLOWED', 'This origin is not allowed to access the API.')
+  }
+  response.setHeader('Access-Control-Allow-Origin', origin)
+  response.setHeader('Vary', 'Origin')
 }
 
-function phaseFor(date = new Date()) {
-  const age = ((date.getTime() - KNOWN_NEW_MOON_UTC) / 86_400_000 % SYNODIC_MONTH_DAYS + SYNODIC_MONTH_DAYS) % SYNODIC_MONTH_DAYS
-  const fraction = age / SYNODIC_MONTH_DAYS
-  const illumination = Math.round((1 - Math.cos(2 * Math.PI * fraction)) * 50)
-  let name
-  if (age < 1.85 || age >= 27.68) name = 'New moon'
-  else if (age < 5.53) name = 'Waxing crescent'
-  else if (age < 9.22) name = 'First quarter'
-  else if (age < 12.91) name = 'Waxing gibbous'
-  else if (age < 16.61) name = 'Full moon'
-  else if (age < 20.30) name = 'Waning gibbous'
-  else if (age < 23.99) name = 'Last quarter'
-  else name = 'Waning crescent'
-  return { name, illumination, ageDays: Math.round(age * 10) / 10, source: 'approximation' }
-}
+async function route(request, url) {
+  if (request.method !== 'GET' && request.method !== 'OPTIONS') {
+    throw new ApiError(405, 'METHOD_NOT_ALLOWED', 'Use GET for this endpoint.')
+  }
 
-function parseCoordinates(url) {
-  const rawLatitude = url.searchParams.get('latitude')
-  const rawLongitude = url.searchParams.get('longitude')
-  if (rawLatitude === null || rawLatitude.trim() === '' || rawLongitude === null || rawLongitude.trim() === '') {
-    return { error: 'Both latitude and longitude are required.' }
+  if (request.method === 'OPTIONS') return { status: 204, body: null }
+  if (url.pathname === '/api/health') {
+    return { status: 200, body: { status: 'ok', service: 'Tsukuyomi Watch API', version: '1.0.0', uptimeSeconds: Math.floor(process.uptime()) } }
   }
-  const latitude = Number(rawLatitude)
-  const longitude = Number(rawLongitude)
-  if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90) {
-    return { error: 'Latitude must be a number from -90 to 90.' }
+  if (url.pathname === '/api/weather') {
+    const { latitude, longitude } = validateCoordinates(url)
+    return { status: 200, body: await getWeather(latitude, longitude) }
   }
-  if (!Number.isFinite(longitude) || longitude < -180 || longitude > 180) {
-    return { error: 'Longitude must be a number from -180 to 180.' }
+  if (url.pathname === '/api/visibility-map') {
+    const { latitude, longitude } = validateCoordinates(url)
+    const rawRadius = url.searchParams.get('radiusKm')
+    const radiusKm = rawRadius === null ? 30 : Number(rawRadius)
+    if (!Number.isFinite(radiusKm) || radiusKm < 5 || radiusKm > 100) {
+      throw new ApiError(400, 'INVALID_RADIUS', 'radiusKm must be a number from 5 to 100.')
+    }
+    return { status: 200, body: await getVisibilityMap(latitude, longitude, radiusKm) }
   }
-  return { latitude, longitude }
-}
-
-async function getWeather(latitude, longitude) {
-  const query = new URLSearchParams({
-    latitude: String(latitude),
-    longitude: String(longitude),
-    current: 'relative_humidity_2m,cloud_cover,visibility',
-    timezone: 'auto',
-  })
-  const upstream = await fetch(`https://api.open-meteo.com/v1/forecast?${query}`, {
-    signal: AbortSignal.timeout(WEATHER_TIMEOUT_MS),
-    headers: { Accept: 'application/json' },
-  })
-  if (!upstream.ok) throw new Error(`Weather provider responded ${upstream.status}`)
-  const payload = await upstream.json()
-  const current = payload.current
-  const cloudCover = Number(current?.cloud_cover)
-  const humidity = Number(current?.relative_humidity_2m)
-  const visibilityMeters = Number(current?.visibility)
-  if (![cloudCover, humidity, visibilityMeters].every(Number.isFinite)) {
-    throw new Error('Weather provider returned incomplete data')
+  if (url.pathname === '/api/stargazing-spots') {
+    const { latitude, longitude } = validateCoordinates(url)
+    return { status: 200, body: await getNearbySpots(latitude, longitude) }
   }
-  const honorScore = Math.max(0, Math.min(100, Math.round(100 - cloudCover * 0.7 - humidity * 0.15)))
-  return {
-    cloudCover,
-    visibilityKm: Math.round((visibilityMeters / 1000) * 10) / 10,
-    humidity,
-    honorScore,
-    observedAt: current.time ?? null,
-    source: 'Open-Meteo',
-    scoreMethod: '100 - (cloud cover × 0.7) - (humidity × 0.15); capped at 0–100',
+  if (url.pathname === '/api/launches') {
+    return { status: 200, body: await getUpcomingLaunches() }
   }
+  if (url.pathname === '/api/moon') {
+    return { status: 200, body: getMoonPhase() }
+  }
+  if (url.pathname === '/api/events') {
+    return { status: 200, body: getEvents(url) }
+  }
+  throw new ApiError(404, 'NOT_FOUND', 'Route not found.')
 }
 
 const server = http.createServer(async (request, response) => {
-  let url
+  const requestId = randomUUID()
+  const startedAt = Date.now()
+  let status = 500
+  response.setHeader('X-Request-Id', requestId)
+  response.setHeader('X-Content-Type-Options', 'nosniff')
+  response.setHeader('Referrer-Policy', 'no-referrer')
+  response.setHeader('Cache-Control', 'no-store')
+
+  response.on('finish', () => {
+    console.log(JSON.stringify({
+      level: 'info',
+      requestId,
+      method: request.method,
+      path: (request.url || '/').split('?')[0],
+      status: response.statusCode,
+      durationMs: Date.now() - startedAt,
+    }))
+  })
+
   try {
-    url = new URL(request.url || '/', 'http://localhost')
-  } catch {
-    return send(response, 400, { error: 'Malformed request URL.' })
-  }
+    applyCors(request, response)
+    const rateHeaders = checkRateLimit(request)
+    for (const [name, value] of Object.entries(rateHeaders)) response.setHeader(name, value)
 
-  if (request.method === 'OPTIONS') {
-    response.writeHead(204, { 'Access-Control-Allow-Methods': 'GET, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' })
-    return response.end()
-  }
-
-  if (url.pathname === '/api/health') {
-    if (request.method !== 'GET') return send(response, 405, { error: 'Method not allowed. Use GET.' })
-    return send(response, 200, { status: 'ok', service: 'Tsukuyomi Watch API' })
-  }
-
-  if (url.pathname === '/api/moon') {
-    if (request.method !== 'GET') return send(response, 405, { error: 'Method not allowed. Use GET.' })
-    return send(response, 200, phaseFor())
-  }
-
-  if (url.pathname === '/api/events') {
-    if (request.method !== 'GET') return send(response, 405, { error: 'Method not allowed. Use GET.' })
-    return send(response, 200, { source: 'demo', events: demoEvents })
-  }
-
-  if (url.pathname === '/api/weather') {
-    if (request.method !== 'GET') return send(response, 405, { error: 'Method not allowed. Use GET.' })
-    const coordinates = parseCoordinates(url)
-    if (coordinates.error) return send(response, 400, { error: coordinates.error })
-    try {
-      const weather = await getWeather(coordinates.latitude, coordinates.longitude)
-      return send(response, 200, weather)
-    } catch (error) {
-      const timedOut = error?.name === 'TimeoutError' || error?.name === 'AbortError'
-      const message = timedOut ? 'Weather provider timed out. Please try again.' : 'Live weather is temporarily unavailable.'
-      return send(response, 502, { error: message, source: 'Open-Meteo' })
+    if ((request.url || '').length > MAX_URL_LENGTH) {
+      throw new ApiError(414, 'URI_TOO_LONG', 'Request URL is too long.')
     }
+    const url = new URL(request.url || '/', 'http://localhost')
+    if (request.method === 'OPTIONS') {
+      response.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS')
+      response.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+      response.setHeader('Access-Control-Max-Age', '600')
+    }
+    const result = await route(request, url)
+    status = result.status
+    if (status === 204) {
+      response.writeHead(204)
+      return response.end()
+    }
+    return sendJson(response, status, { ...result.body, requestId }, {
+      'RateLimit-Limit': response.getHeader('RateLimit-Limit'),
+      'RateLimit-Remaining': response.getHeader('RateLimit-Remaining'),
+      'RateLimit-Reset': response.getHeader('RateLimit-Reset'),
+      'X-Request-Id': requestId,
+      ...(result.body.cache === 'stale' ? { Warning: '110 - "Response is stale; upstream unavailable"' } : {}),
+    })
+  } catch (error) {
+    status = error instanceof ApiError ? error.status : 500
+    if (!response.headersSent) return sendError(response, requestId, error)
+    response.destroy(error)
   }
-
-  return send(response, 404, { error: 'Route not found.' })
 })
 
 server.requestTimeout = 10_000
 server.headersTimeout = 12_000
-server.listen(PORT, '0.0.0.0', () => console.log(`Tsukuyomi API listening on http://localhost:${PORT}`))
+server.keepAliveTimeout = 5_000
+server.maxHeadersCount = 50
+server.on('clientError', (_error, socket) => {
+  if (socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n')
+})
+
+server.listen(PORT, '127.0.0.1', () => console.log(`Tsukuyomi API listening on http://localhost:${PORT}`))
+
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.on(signal, () => server.close(() => process.exit(0)))
+}

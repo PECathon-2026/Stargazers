@@ -3,5 +3,10 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "scripts": { "start": "node server.js", "dev": "node --watch server.js" }
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "check": "node --check server.js && node --check src/http.js && node --check src/cache.js && node --check src/middleware/rate-limit.js && node --check src/services/weather.js && node --check src/services/moon.js && node --check src/services/events.js && node --check src/services/launches.js && node --check src/services/spots.js"
+  }
 }
